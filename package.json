@@ -4,7 +4,7 @@
   "description": "magpie provider plugin: 星驰 (api.xingchiapi.com) OpenAI Responses 网关",
   "type": "module",
   "main": "./index.mjs",
-  "files": ["index.mjs", "README.md", "LICENSE"],
+  "files": ["index.mjs", "README.md", "LICENSE", "icon.svg"],
   "keywords": ["opencode", "opencode-plugin", "magpie", "xingchi", "provider", "magpie-plugin"],
   "license": "MIT",
   "repository": {
@@ -16,6 +16,7 @@
   },
   "homepage": "https://github.com/postdare/magpie-plugin-xingchi#readme",
   "magpie": {
+    "icon": "https://raw.githubusercontent.com/postdare/magpie-plugin-xingchi/main/icon.svg",
     "name": "星驰 Xingchi",
     "summary": {
       "en": "Xingchi (api.xingchiapi.com) OpenAI Responses gateway for coding agents.",
