@@ -1,0 +1,26 @@
+{
+  "name": "magpie-plugin-xingchi",
+  "version": "0.1.0",
+  "description": "magpie provider plugin: 星驰 (api.xingchiapi.com) OpenAI Responses 网关",
+  "type": "module",
+  "main": "./index.mjs",
+  "files": ["index.mjs", "README.md", "LICENSE"],
+  "keywords": ["opencode", "opencode-plugin", "magpie", "xingchi", "provider", "magpie-plugin"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/postdare/magpie-plugin-xingchi.git"
+  },
+  "bugs": {
+    "url": "https://github.com/postdare/magpie-plugin-xingchi/issues"
+  },
+  "homepage": "https://github.com/postdare/magpie-plugin-xingchi#readme",
+  "magpie": {
+    "name": "星驰 Xingchi",
+    "summary": {
+      "en": "Xingchi (api.xingchiapi.com) OpenAI Responses gateway for coding agents.",
+      "zh": "星驰（api.xingchiapi.com）OpenAI Responses 网关，供编程客户端使用。"
+    },
+    "maxConcurrency": 4
+  }
+}
