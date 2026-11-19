@@ -61,10 +61,13 @@ const UA_PRESETS = {
 const DEFAULT_UA_KEY = "opencode"
 const DEFAULT_UA = UA_PRESETS[DEFAULT_UA_KEY]
 
-// 文本模型（网关另有 gpt-image-* 图片模型，其生图接口对本账号未开通，故不暴露）。
+// 文本模型的静态兜底清单（网关另有 gpt-image-* 图片模型，其生图接口对本账号未开通，故不暴露）。
 // context/output 取 omp 内置目录里同名 id 的值（gpt-5.6-* 与 gpt-6-* 为 272000/128000，
 // gpt-6.1-* 为 500000/128000）；目录里没有的按 omp 的通用默认值 128000/32768。
-// tools:false = 该模型在本账号的上游通道上不支持工具调用（实测），别让 agent 选它做工具活。
+//
+// 这份清单只是兜底：登录后 provider.models 钩子会拉网关的实时清单，并逐个实测
+// 模型能不能带工具调用（见 probeToolSupport）。网关按模型分上游账号池，池子会变
+// （同一个模型昨天不支持工具、今天支持），所以能力不能写死在清单里。
 const MODELS = {
   "gpt-5.6": { name: "GPT-5.6", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
   "gpt-5.6-sol": { name: "GPT-5.6 Sol", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
@@ -74,10 +77,8 @@ const MODELS = {
   "gpt-6-sol": { name: "GPT-6 Sol", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
   "gpt-6-luna": { name: "GPT-6 Luna", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
   "gpt-6-astra": { name: "GPT-6 Astra", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  // 这两个模型的上游通道只支持 Chat Completions，带工具调用时被网关拒绝（与推理无关）：
-  // "gpt-6.1-sol requires Responses for tool calls; this account only supports Chat Completions"
-  "gpt-6.1-sol": { name: "GPT-6.1 Sol", context: 500000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"], tools: false },
-  "gpt-6.1-terra": { name: "GPT-6.1 Terra", context: 500000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"], tools: false },
+  "gpt-6.1-sol": { name: "GPT-6.1 Sol", context: 500000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-6.1-terra": { name: "GPT-6.1 Terra", context: 500000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
   "gpt-5.5": { name: "GPT-5.5", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh"] },
   "gpt-5.4": { name: "GPT-5.4", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh"] },
   "gpt-5.4-mini": { name: "GPT-5.4 Mini", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh"] },
@@ -169,7 +170,7 @@ function normalizeResponsesBody(text) {
   return JSON.stringify(body)
 }
 
-function modelEntry(spec, id) {
+function modelEntry(spec, id, toolCall = true) {
   const variants = {}
   for (const effort of spec.efforts) variants[effort] = {}
   return {
@@ -177,10 +178,100 @@ function modelEntry(spec, id) {
     name: spec.name,
     limit: { context: spec.context, output: spec.output },
     reasoning: true,
-    tool_call: spec.tools !== false,
+    tool_call: toolCall,
     modalities: { input: ["text"] },
     variants,
   }
+}
+
+// 探测一个模型能不能带工具调用。
+//
+// 网关按模型分上游账号池，池子会变：同一个模型今天能带工具、明天可能不能
+// （换成了只支持 Chat Completions 的上游，就报
+// "requires Responses for tool calls; this account only supports Chat Completions"）。
+// 所以能力只能现测，不能写死在清单里。
+//
+// 用 tool_choice 强制调用来探测：只带 tools 而不强制，模型可以走纯文本回答，
+// 网关的通道检查就不会触发（实测 tool_choice:none 在不支持工具的通道上也通过）。
+//
+// 返回 true / false；探测本身失败（限流、模型已不在池子里、网络问题）返回 null，
+// 表示"这次没测出来"，调用方应保留原值而不是当成 false。
+async function probeToolSupport(baseUrl, key, model, ua) {
+  try {
+    const res = await fetch(`${baseUrl}/responses`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${key}`,
+        "content-type": "application/json",
+        "user-agent": ua,
+      },
+      body: JSON.stringify({
+        model,
+        input: "probe",
+        tools: [
+          {
+            type: "function",
+            name: "probe_tool",
+            description: "Tool support probe. Never call it.",
+            parameters: { type: "object", properties: {}, additionalProperties: false },
+          },
+        ],
+        tool_choice: { type: "function", name: "probe_tool" },
+        max_output_tokens: 16,
+      }),
+    })
+    const text = await res.text()
+    if (res.ok) return true
+    let message = text
+    try {
+      message = JSON.parse(text)?.error?.message ?? text
+    } catch {}
+    // 明确的"不支持工具"才是 false。
+    // 注意别把"模型不在账号池里"（not supported by any configured account）
+    // 也算进去——那是"这次没测出来"，不是"这个模型不支持工具"。
+    if (/only supports chat completions|does not support (tool|function)|tool[_ ]?call[s]? (is |are )?not (supported|available)|tools? (is |are )?not (supported|available|allowed)/i.test(message)) {
+      return false
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+// 探测结果按 (网关, key, 模型) 缓存，TTL 6 小时：账号池不会几分钟一变，
+// 没必要每次登录都重打一轮探测。
+const PROBE_TTL_MS = 6 * 60 * 60 * 1000
+const probeCache = new Map()
+
+function cacheKey(baseUrl, key, model) {
+  return `${baseUrl}\n${key}\n${model}`
+}
+
+function cachedProbe(baseUrl, key, model) {
+  const hit = probeCache.get(cacheKey(baseUrl, key, model))
+  if (!hit) return undefined
+  if (Date.now() - hit.at > PROBE_TTL_MS) {
+    probeCache.delete(cacheKey(baseUrl, key, model))
+    return undefined
+  }
+  return hit.value
+}
+
+function rememberProbe(baseUrl, key, model, value) {
+  if (value === null) return
+  probeCache.set(cacheKey(baseUrl, key, model), { at: Date.now(), value })
+}
+
+// 一次最多 limit 个并发。
+async function mapWithLimit(items, limit, fn) {
+  let index = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (index < items.length) {
+      const item = items[index++]
+      await fn(item)
+    }
+  })
+  await Promise.all(workers)
 }
 
 export const _internal = {
@@ -188,6 +279,8 @@ export const _internal = {
   pickUserAgent,
   resolveUserAgent,
   uaToken,
+  probeToolSupport,
+  mapWithLimit,
   ALLOWED_UA_TOKENS,
   UA_PRESETS,
   DEFAULT_UA,
@@ -288,36 +381,60 @@ export const XingchiPlugin = async (_input, options) => {
       id: PROVIDER,
       async models(provider, { auth } = {}) {
         if (auth?.type !== "api" || !auth.key) return provider.models
+        const ua = pickUserAgent(null, userAgent)
+        let data
         try {
           const res = await fetch(`${baseUrl}/models`, {
-            headers: { authorization: `Bearer ${auth.key}`, "user-agent": pickUserAgent(null, userAgent) },
+            headers: { authorization: `Bearer ${auth.key}`, "user-agent": ua },
           })
           if (!res.ok) return provider.models
-          const { data } = await res.json()
-          if (!Array.isArray(data)) return provider.models
-          const out = { ...provider.models }
-          for (const row of data) {
-            const id = row?.id
-            if (!id || id.startsWith("gpt-image")) continue
-            const spec = MODELS[id]
-            if (spec) {
-              out[id] = modelEntry(spec, id)
-              continue
-            }
-            // 网关上新出现的文本模型：保守的上下文/输出上限，避免超过上游限制。
-            out[id] = {
-              id,
-              name: row.display_name ?? id,
-              limit: { context: 128000, output: 32768 },
-              reasoning: false,
-              tool_call: true,
-              modalities: { input: ["text"] },
-            }
-          }
-          return out
+          const body = await res.json()
+          if (!Array.isArray(body?.data)) return provider.models
+          data = body.data
         } catch {
           return provider.models
         }
+
+        // 网关的实时清单：它只列出这个账号池现在真能用的模型（清单之外的模型
+        // 会报 "not supported by any configured account"），所以以它为准，
+        // 静态 MODELS 只用来补每个模型的名字和上下文/输出上限。
+        const out = {}
+        const ids = []
+        for (const row of data) {
+          const id = row?.id
+          if (!id || id.startsWith("gpt-image")) continue
+          ids.push(id)
+          const spec = MODELS[id]
+          if (spec) {
+            out[id] = modelEntry(spec, id)
+            continue
+          }
+          // 网关上新出现的文本模型：保守的上下文/输出上限，避免超过上游限制。
+          out[id] = {
+            id,
+            name: row.display_name ?? id,
+            limit: { context: 128000, output: 32768 },
+            reasoning: false,
+            tool_call: true,
+            modalities: { input: ["text"] },
+          }
+        }
+
+        // 逐个实测工具调用能力（缓存 6 小时）。探测失败就保持原值。
+        // 探测是真请求，一次最多几个并发，别把网关打出限流。
+        await mapWithLimit(ids, 4, async (id) => {
+          const cached = cachedProbe(baseUrl, auth.key, id)
+          if (cached !== undefined) {
+            out[id].tool_call = cached
+            return
+          }
+          const probed = await probeToolSupport(baseUrl, auth.key, id, ua)
+          if (probed === null) return
+          rememberProbe(baseUrl, auth.key, id, probed)
+          out[id].tool_call = probed
+        })
+
+        return out
       },
     },
   }

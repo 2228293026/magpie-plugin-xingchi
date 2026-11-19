@@ -1,7 +1,16 @@
 import { expect, test } from "bun:test"
 import { _internal } from "../index.mjs"
 
-const { normalizeResponsesBody, pickUserAgent, resolveUserAgent, uaToken, UA_PRESETS, DEFAULT_UA } = _internal
+const {
+  normalizeResponsesBody,
+  pickUserAgent,
+  resolveUserAgent,
+  uaToken,
+  probeToolSupport,
+  mapWithLimit,
+  UA_PRESETS,
+  DEFAULT_UA,
+} = _internal
 
 test("uaToken 只取斜杠前的客户端名", () => {
   expect(uaToken("omp/18.22.2")).toBe("omp")
@@ -86,4 +95,67 @@ test("只有 system 消息时降级成 user 消息", () => {
 
 test("非法 JSON 原样返回", () => {
   expect(normalizeResponsesBody("not json")).toBe("not json")
+})
+
+test("mapWithLimit 限制并发", async () => {
+  let running = 0
+  let peak = 0
+  await mapWithLimit([1, 2, 3, 4, 5, 6, 7], 3, async () => {
+    running++
+    peak = Math.max(peak, running)
+    await new Promise((r) => setTimeout(r, 5))
+    running--
+  })
+  expect(peak).toBeLessThanOrEqual(3)
+  expect(peak).toBeGreaterThan(1)
+})
+
+test("mapWithLimit 全部执行", async () => {
+  const seen = []
+  await mapWithLimit([1, 2, 3, 4], 2, async (n) => {
+    seen.push(n)
+  })
+  expect(seen.sort()).toEqual([1, 2, 3, 4])
+})
+
+test("mapWithLimit 空数组不报错", async () => {
+  await mapWithLimit([], 4, async () => {
+    throw new Error("不该被调用")
+  })
+})
+
+test("探测把各种网关回答归类", async () => {
+  const original = globalThis.fetch
+  const reply = async (status, body) => {
+    globalThis.fetch = async () => new Response(body, { status })
+  }
+  try {
+    // 成功 → 支持工具
+    await reply(200, JSON.stringify({ output: [{ type: "function_call" }] }))
+    expect(await probeToolSupport("https://x/v1", "k", "m", "omp/1")).toBe(true)
+
+    // 明确不支持工具 → 不支持
+    await reply(400, JSON.stringify({ error: { message: "m requires Responses for tool calls; this account only supports Chat Completions" } }))
+    expect(await probeToolSupport("https://x/v1", "k", "m", "omp/1")).toBe(false)
+
+    // 模型已不在账号池里 → 没测出来（不是"不支持工具"）
+    await reply(400, JSON.stringify({ error: { message: 'Model "m" is not supported by any configured account in this group' } }))
+    expect(await probeToolSupport("https://x/v1", "k", "m", "omp/1")).toBe(null)
+
+    // 限流 → 没测出来
+    await reply(429, JSON.stringify({ error: { message: "Upstream rate limit exceeded" } }))
+    expect(await probeToolSupport("https://x/v1", "k", "m", "omp/1")).toBe(null)
+
+    // 上游 5xx → 没测出来
+    await reply(503, JSON.stringify({ error: { message: "Service temporarily unavailable" } }))
+    expect(await probeToolSupport("https://x/v1", "k", "m", "omp/1")).toBe(null)
+
+    // 网络异常 → 没测出来
+    globalThis.fetch = async () => {
+      throw new Error("boom")
+    }
+    expect(await probeToolSupport("https://x/v1", "k", "m", "omp/1")).toBe(null)
+  } finally {
+    globalThis.fetch = original
+  }
 })
