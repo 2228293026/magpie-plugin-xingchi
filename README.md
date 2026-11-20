@@ -3,13 +3,13 @@
 星驰 API 网关（<https://api.xingchiapi.com>）的 magpie / OpenCode 供应商插件。
 
 网关是 OpenAI Responses 兼容的编程客户端网关，只放行已知的编程客户端；插件负责
-两件网关特有的事：**User-Agent 白名单**和**Responses 协议改写**。
+三件网关特有的事：**User-Agent 白名单**、**Responses 协议改写**和**每日签到**。
 
 ## 安装
 
 ```sh
 magpie plugin add postdare/magpie-plugin-xingchi   # 从 GitHub 装
-magpie plugin login xingchi                        # 输入 sk-… key
+magpie plugin login xingchi                        # 选一种登录方式
 magpie provider test xingchi                       # 冒烟
 magpie quota                                       # 看额度
 ```
@@ -21,6 +21,123 @@ magpie plugin add ./magpie-plugin-xingchi
 ```
 
 之后模型以 `xingchi/gpt-5.6` 这样的 id 出现。
+
+## 三种登录方式
+
+`magpie plugin login xingchi` 会让你选：
+
+| 方式 | 怎么填 | 能用模型 | 能自动签到 |
+| --- | --- | --- | --- |
+| **Xingchi 浏览器登录** | 点一下，在弹出的浏览器里登录 | ✅ | ✅ |
+| **Xingchi API key** | `sk-…` | ✅ | ❌ |
+| **Xingchi 网页令牌** | 浏览器里的 `access_token` | ✅ | ✅ |
+
+### 浏览器登录（推荐）
+
+选「Xingchi 浏览器登录」后，插件会起一个独立的 Chrome / Edge 窗口并打开
+<https://xingchiapi.com/login>。你在那个窗口里正常登录（邮箱密码 + Turnstile，
+或者 linux.do / GitHub 第三方登录都行），**登录完插件自动接手**，不用复制任何东西。
+
+插件做的是：给浏览器开一个调试端口，用 CDP 读页面里的
+`localStorage.auth_token` / `refresh_token`，再拿这个会话去面板的
+`/api/v1/keys` 挑一把（或新建一把）API key 供网关用。整个过程不需要你的密码。
+
+浏览器 profile 独立存放在：
+
+| 平台 | 路径 |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\magpie\xingchi-browser` |
+| macOS / Linux | `~/.config/magpie/xingchi-browser` |
+
+所以登录过一次之后，下次登录通常不用再输密码。可以用环境变量改：
+
+- `XINGCHI_BROWSER` —— 指定浏览器可执行文件（默认自动找 Chrome / Edge）
+- `XINGCHI_PROFILE` —— 指定 profile 目录
+
+### 为什么签到不能只靠 API key
+
+签到接口在面板的 `/api/v1/user/checkin` 下，鉴权走的是**网页登录的 JWT**，
+不是 API key（拿 API key 去调会被判成 `INVALID_TOKEN`）。而面板登录被
+Cloudflare Turnstile 挡着，程序化提交会被拒（`turnstile verification failed`），
+所以要么用真浏览器登录（上面的浏览器登录），要么手动复制一次令牌（网页令牌方式）。
+
+### API key 必须绑定分组
+
+面板里的 API key 必须挂在一个分组（group）上，否则网关直接回 403：
+
+```
+{"error":{"message":"API Key is not assigned to any group and cannot be used.
+ Please contact the administrator to assign it to a group.","type":"permission_error"}}
+```
+
+浏览器登录时插件会自己处理这件事：
+
+1. 先看面板里现有的 key，**只挑已经绑定分组的**；
+2. 没有的话，从 `/api/v1/groups/available` 取一个可用分组；
+3. 如果有一把插件自己建的（名字是 `magpie`）没绑分组，给它补上分组；
+4. 都没有就新建一把，**并且带上 `group_id`**。
+
+### 多账号
+
+同一个供应商可以登录多个账号，每个账号单独记一套凭据：
+
+```sh
+magpie plugin login xingchi   # 再来一次，用另一个账号登录
+```
+
+插件会把面板里的邮箱作为账号标识（`accountId`）交给 magpie，所以不同邮箱的
+登录会被存成不同账号，在供应商页和路由组里可以分别选、分别签到、分别看额度。
+用同一个邮箱重复登录则是替换掉原账号。
+
+### 每日签到
+
+签到走 magpie 的 `auth.checkin` 钩子：开了签到开关后，magpie 每个北京日为每个
+已登录账号调一次，结果显示在账号的用量卡片和设置里。
+
+**取令牌**：先在浏览器登录 <https://xingchiapi.com/dashboard>，然后在控制台执行
+
+```js
+copy(JSON.stringify({
+  access_token: localStorage.getItem("auth_token"),
+  refresh_token: localStorage.getItem("refresh_token"),
+}))
+```
+
+把复制到的 JSON 整块粘进「网页 access_token」那一栏即可；`refresh_token` 会
+一并带出来（留空也能签，只是会话过期后要重新登录）。API key 那栏可以留空，
+插件会用会话去面板的 `/api/v1/keys` 里自动挑一把现成的，没有就建一把。
+
+```sh
+magpie plugin login xingchi   # 选「Xingchi 网页令牌」
+```
+
+之后：
+
+```sh
+magpie quota        # 额度窗口上会多一个「每日签到」条目
+```
+
+面板接口实测：
+
+| 接口 | 返回 |
+| --- | --- |
+| `GET /api/v1/user/checkin` | `{ enabled, claimed_today, amount, total_count, total_amount }` |
+| `POST /api/v1/user/checkin` | `{ status: { … }, amount }` |
+| 重复领取 | `{ code, message, reason: "CHECKIN_ALREADY_CLAIMED" }` |
+
+插件把结果映射成 magpie 的签到语义：
+
+| 面板状态 | outcome |
+| --- | --- |
+| `enabled: false` | `inactive`（站点没开签到活动） |
+| `claimed_today: true` | `done`（今天已签，带累计次数） |
+| 领取成功 | `claimed`（带 `credit` 额度与 `streak` 累计次数） |
+| `CHECKIN_ALREADY_CLAIMED` | `done` |
+| 会话过期且 refresh_token 也失效 | `failed`（提示重新登录） |
+
+会话过期时插件会用 `refresh_token` 调 `POST /api/v1/auth/refresh` 换一张新令牌，
+并把它写回账号，所以正常情况下不会中途掉线。浏览器登录的账号还挂了 magpie 的
+`auth.refresh` 钩子：令牌快过期时 magpie 会主动续期并写回。
 
 ## 选 UA
 
@@ -106,7 +223,12 @@ magpie plugin options magpie-plugin-xingchi '{"userAgent":"claude-cli/2.1.327 (e
 
 `chat/completions` 形态的请求体（含 `messages`）原样放行。
 
-### 3. 按模型的上游通道（能力实测，不写死）
+### 3. 每日签到
+
+见上面的「每日签到」一节。签到接口不在网关的 `/v1` 下，而在面板的 `/api/v1`
+下，用网页登录的 JWT 鉴权。
+
+### 4. 按模型的上游通道（能力实测，不写死）
 
 网关按模型分上游账号池，**池子会变**：
 
@@ -134,7 +256,7 @@ magpie plugin options magpie-plugin-xingchi '{"userAgent":"claude-cli/2.1.327 (e
 探测结果按（网关, key, 模型）缓存 6 小时，最多 4 个并发——账号池不会几分钟一变，
 不必每次登录都重打一轮。
 
-### 4. 其他已验证事实
+### 5. 其他已验证事实
 
 - 工具调用：Responses 的 `function_call` / `function_call_output` 与 chat 的
   `tool_calls` / `tool` 角色都正常；`strict: true` 也被接受。
@@ -147,6 +269,34 @@ magpie plugin options magpie-plugin-xingchi '{"userAgent":"claude-cli/2.1.327 (e
 - 图片模型（`gpt-image-*`）在本账号未开通（`Image generation is not enabled for this
   group`），插件不暴露它们。
 
+## 全部渠道（分组）与倍率
+
+面板按**分组**划分模型：每个分组有自己的倍率（`rate_multiplier`）和自己的模型清单，
+而**一把 API key 只属于一个分组**（用别的分组的 key 请求，会得到
+`Model "x" is not supported by any configured account in this group`）。
+
+所以「同时显示全部渠道」的做法是：
+
+1. 插件读面板的分组清单（`/api/v1/groups/available`），每个分组各配一把 key
+   （现成的优先，没有就建一把，名字 `magpie-g<分组id>`）；
+2. 每个分组的模型清单都用**那把 key** 去问网关；
+3. 同一个模型在多个分组都有时，各算一条，显示名后面带倍率：
+
+   | 模型 id | 显示名 |
+   | --- | --- |
+   | `gpt-6.1-sol` | GPT-6.1 Sol · 0.5x |
+   | `gpt-6.1-sol-g4` | GPT-6.1 Sol · 1x |
+
+4. 模型 id 上的 `-g<分组id>` 标记经 `apiId` 传到 loader，loader 据此换成那个分组的
+   key，并把标记从请求体里去掉再发给厂商。
+
+**余额不足的渠道会标出来。** 有些分组从「专属余额」里扣钱（`balance_source:
+dedicated`），账号没有那笔余额时列出来也是 503，所以名字后面会加「（余额不足）」，
+渠道仍然列出来（你能看到有哪些渠道），但别去选它。
+
+分组信息缓存在插件旁边的 `xingchi-groups.json`：只有 API key 的账号没有面板会话，
+读这份缓存才能标出倍率。
+
 ## 模型
 
 登录后插件拉网关的**实时清单**（`/v1/models`），只列出这个账号池现在真能用的文本模型；
@@ -158,14 +308,67 @@ magpie plugin options magpie-plugin-xingchi '{"userAgent":"claude-cli/2.1.327 (e
 
 工具能力由实测决定（见「按模型的上游通道」），不写死在清单里。
 
-## 用量
+## 思考等级与「思考过程」显示
 
-`/v1/usage` 返回 `{ quota: { limit, used, remaining, unit }, usage: { today, total } }`，
-插件把它映射成 magpie 的额度窗口与余额。
+模型清单里的等级就是 magpie 发给厂商的 `reasoning.effort`：low / medium / high /
+xhigh / max（magpie 还会自己加一个 ultra，它发出去时按 max 处理）。
+
+**思考一定会跑，但「思考过程」不一定显示得出来。** 实测（同一个问题、同一个
+模型、`effort=high`、连发 6 次）：
+
+```
+摘要事件数：0  2  0  0  2  0
+```
+
+每次请求的 `reasoning` 项都在（模型确实在推理），但**摘要文本要不要转发给客户端，
+取决于这次请求命中了上游账号池里的哪一个账号**——只有一部分账号会转发 reasoning
+摘要。所以界面上的「思考过程」时有时无，和客户端、和插件都无关，是上游账号池的
+行为。
+
+插件侧能做的是显式带上 `summary: "auto"`（上游愿意转发时一定会转），已经加了。
+
+另外两点：
+
+- 之前上游返回 2xx 但没有可领的，是 `done` 不是 `failed`，magpie 不会再问；
+- 上游的 `/v1/chat/completions` 已停用（`chat_completions_disabled`），
+  只能用 Responses API。
+
+## 用量与账号卡片
+
+网关的 `/v1/usage` 现在返回（老版本是 `quota` 对象，两种都认）：
+
+```json
+{ "balance": 297.42, "remaining": 297.42, "unit": "USD", "mode": "unrestricted",
+  "planName": "钱包余额", "daily_usage": [ … ], "usage": { "today": { … }, "total": { … } } }
+```
+
+插件把它映射成 magpie 的账号卡片：
+
+| 卡片上的 | 来自 |
+| --- | --- |
+| **额度 X / Y USD · 剩余 Z%** | 累计消费 / 累计获得（余额 + 累计消费），带进度条 |
+| **今日消费 X USD · N 次请求 · N tokens** | 网关的 `usage.today` |
+| **每日签到 今日已签到 · 累计 N 次 ↻ 明天 00:00** | 面板的 `/user/checkin` |
+| **余额 X USD** | 顶层的 `balance`，magpie 据此画「余额走势」曲线 |
+
+**关于走势图。** magpie 的规则是：一张卡片**有窗口时，曲线画的是窗口的**，没有窗口
+才画余额的曲线（`noteCardHistory`：`q.Balance != "" && len(q.Windows) == 0`）。
+所以插件把额度窗口的「剩余」做成**正好等于钱包余额**——窗口的
+`limit - amount = 余额`——这样窗口的曲线就是余额走势，而顶层的 `balance`
+另外给出卡片底部的「余额」那一行。
+
+窗口的读数由 magpie 记进 `quota-history.json`，读满两次、间隔够久就会画出曲线
+（每读一次只留一个点，间隔太近的会顶掉上一个）。
+
+密钥配了额度上限时（面板里的「设置配额上限」），额度窗口改用真的上限，
+显示成「已用 / 上限」。
+
+用了「网页令牌」登录时，账号卡片上还会多一个「每日签到」的窗口，显示今天是否已签、
+累计签到次数。这是 `aside` 窗口，不参与路由决策。
 
 ## 自行测试
 
 ```sh
-bun test                                        # 单元：UA 选择、请求体改写、能力探测分类
+bun test                                        # 单元：UA 选择、请求体改写、能力探测分类、签到状态分类、浏览器登录
 XINGCHI_API_KEY=sk-… bun run scripts/smoke.mjs   # 打真实网关
 ```
