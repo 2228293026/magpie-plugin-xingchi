@@ -7,8 +7,9 @@
 #    版本号不参与校验，所以写死当前版本即可；换客户端身份就改这一行，例如
 #    User-Agent: "claude-cli/2.1.327 (external, cli)"
 #  - 密钥放在 ~/.omp/agent/.env 的 XINGCHI_API_KEY（此处的值是环境变量名）。
-#  - contextWindow/maxTokens 取 omp 内置目录里同名 id 的值；目录里没有的用通用默认
-#    128000/32768（omp 的溢出提示与压缩会兜住偏小的估计）。
+#  - contextWindow/maxTokens 已按上游模型目录（https://models.dev/api.json，2026-11-20）同步。
+#    星驰这把 Key 的 Codex 清单另报 Sol 默认 500000、最大 872000；客户端仍按模型规格配置。
+#    gpt-6 沿用 gpt-6-astra 别名规格；目录未收录的 codex-auto-review 保留 128000/32768 兜底。
 providers:
    xingchi:
       baseUrl: https://api.xingchiapi.com/v1
@@ -24,49 +25,49 @@ providers:
            name: GPT-5.6 (Sol)
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-5.6-sol
            name: GPT-5.6 Sol
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-5.6-terra
            name: GPT-5.6 Terra
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-5.6-luna
            name: GPT-5.6 Luna
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-6
            name: GPT-6
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-6-sol
            name: GPT-6 Sol
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-6-luna
            name: GPT-6 Luna
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-6-astra
            name: GPT-6 Astra
            reasoning: true
            input: [text]
-           contextWindow: 272000
+           contextWindow: 1050000
            maxTokens: 128000
          # gpt-6.1-sol / gpt-6.1-terra 的上游通道只支持 Chat Completions，
          # 带工具调用会被网关拒（requires Responses for tool calls; this account
@@ -75,38 +76,38 @@ providers:
            name: GPT-6.1 Sol
            reasoning: true
            input: [text]
-           contextWindow: 500000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-6.1-terra
            name: GPT-6.1 Terra
            reasoning: true
            input: [text]
-           contextWindow: 500000
+           contextWindow: 1050000
            maxTokens: 128000
          - id: gpt-5.5
            name: GPT-5.5
            reasoning: true
            input: [text]
-           contextWindow: 128000
-           maxTokens: 32768
+           contextWindow: 1050000
+           maxTokens: 128000
          - id: gpt-5.4
            name: GPT-5.4
            reasoning: true
            input: [text]
-           contextWindow: 128000
-           maxTokens: 32768
+           contextWindow: 1050000
+           maxTokens: 128000
          - id: gpt-5.4-mini
            name: GPT-5.4 Mini
            reasoning: true
            input: [text]
-           contextWindow: 128000
-           maxTokens: 32768
+           contextWindow: 400000
+           maxTokens: 128000
          - id: gpt-5.3-codex-spark
            name: GPT-5.3 Codex Spark
            reasoning: true
            input: [text]
            contextWindow: 128000
-           maxTokens: 32768
+           maxTokens: 32000
          - id: codex-auto-review
            name: Codex Auto Review
            reasoning: true
@@ -117,5 +118,5 @@ providers:
            name: GPT-5.2
            reasoning: true
            input: [text]
-           contextWindow: 128000
-           maxTokens: 32768
+           contextWindow: 400000
+           maxTokens: 128000

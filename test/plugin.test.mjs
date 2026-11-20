@@ -964,8 +964,24 @@ test("模型清单合并全部分组，名字后面带倍率", async () => {
         return new Response(
           JSON.stringify({
             data: [
-              { id: "gpt-6.1-sol", display_name: "GPT-6.1 Sol" },
-              { id: "gpt-5.6-sol", display_name: "GPT-5.6 Sol" },
+              ...[
+                "gpt-5.6",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-6",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+                "codex-auto-review",
+                "gpt-5.2",
+              ].map((id) => ({ id, display_name: id })),
               { id: "gpt-image-1", display_name: "Image" },
             ],
           }),
@@ -1001,6 +1017,29 @@ test("模型清单合并全部分组，名字后面带倍率", async () => {
     expect(models["gpt-5.6-sol-g4"].rate).toBe(1)
     // 内部形状：推理能力在 capabilities 里，否则 magpie 当成"这模型不推理"
     expect(models["gpt-6.1-sol"].capabilities.reasoning).toBe(true)
+    // 所有目录匹配项都应同步为上游总上下文与输出规格。
+    for (const [id, context, output] of [
+      ["gpt-5.6", 1050000, 128000],
+      ["gpt-5.6-sol", 1050000, 128000],
+      ["gpt-5.6-terra", 1050000, 128000],
+      ["gpt-5.6-luna", 1050000, 128000],
+      ["gpt-6", 1050000, 128000],
+      ["gpt-6-sol", 1050000, 128000],
+      ["gpt-6-luna", 1050000, 128000],
+      ["gpt-6-astra", 1050000, 128000],
+      ["gpt-6.1-sol", 1050000, 128000],
+      ["gpt-6.1-terra", 1050000, 128000],
+      ["gpt-5.5", 1050000, 128000],
+      ["gpt-5.4", 1050000, 128000],
+      ["gpt-5.4-mini", 400000, 128000],
+      ["gpt-5.3-codex-spark", 128000, 32000],
+      ["gpt-5.2", 400000, 128000],
+    ]) {
+      expect(models[id + "-g4"].limit).toEqual({ context, output })
+    }
+    expect(models["codex-auto-review-g4"].limit).toEqual({ context: 128000, output: 32768 })
+    expect(models["gpt-6.1-sol"].limit).toEqual({ context: 1050000, output: 128000 })
+    expect(models["gpt-6.1-sol-g4"].limit).toEqual({ context: 1050000, output: 128000 })
     expect(Object.keys(models["gpt-6.1-sol"].variants)).toEqual([
       "low",
       "medium",
