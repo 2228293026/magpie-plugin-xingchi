@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"D:/Projects/magpie-plugin-xingchi/scripts/codex-handoff.mjs\" magpie --all-projects",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

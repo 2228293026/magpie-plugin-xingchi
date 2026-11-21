@@ -7,6 +7,9 @@
   "files": [
     "index.mjs",
     "browser.mjs",
+    "history.mjs",
+    "scripts/codex-handoff.mjs",
+    "examples/codex-handoff.hooks.json",
     "README.md",
     "LICENSE",
     "icon.svg"
@@ -36,6 +39,11 @@
       "en": "Xingchi (api.xingchiapi.com) OpenAI Responses gateway for coding agents: browser sign-in, multiple accounts and daily check-in.",
       "zh": "星驰（api.xingchiapi.com）OpenAI Responses 网关：浏览器点击登录、支持多账号、可每日签到。"
     },
-    "maxConcurrency": 4
+    "maxConcurrency": 4,
+    "options": {
+      "historyPacking": true,
+      "codexAutoHandoff": false,
+      "codexAutoOpen": true
+    }
   }
 }

@@ -29,6 +29,7 @@ import { dirname, join as joinPath } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { openBrowserSession } from "./browser.mjs"
+import { packResponsesHistory } from "./history.mjs"
 
 const PROVIDER = "xingchi"
 const BASE_URL = "https://api.xingchiapi.com/v1"
@@ -75,28 +76,30 @@ const DEFAULT_UA_KEY = "opencode"
 const DEFAULT_UA = UA_PRESETS[DEFAULT_UA_KEY]
 
 // 文本模型的静态兜底清单（网关另有 gpt-image-* 图片模型，其生图接口对本账号未开通，故不暴露）。
-// context/output 取 omp 内置目录里同名 id 的值（gpt-5.6-* 与 gpt-6-* 为 272000/128000，
-// gpt-6.1-* 为 500000/128000）；目录里没有的按 omp 的通用默认值 128000/32768。
+// context/output 取上游模型目录（https://models.dev/api.json，2026-11-20）中的总上下文/输出值。
+// GPT-6.1 Sol 按用户指定使用模型 API 规格 1050000/128000；星驰该 Key 的 Codex 清单
+// 单独报告默认 500000、最大 872000。gpt-6 是 gpt-6-astra 的别名；codex-auto-review
+// 没有目录记录，保留 128000/32768 通用兜底。
 //
 // 这份清单只是兜底：登录后 provider.models 钩子会拉网关的实时清单，并逐个实测
 // 模型能不能带工具调用（见 probeToolSupport）。网关按模型分上游账号池，池子会变
 // （同一个模型昨天不支持工具、今天支持），所以能力不能写死在清单里。
 const MODELS = {
-  "gpt-5.6": { name: "GPT-5.6", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.6-sol": { name: "GPT-5.6 Sol", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.6-terra": { name: "GPT-5.6 Terra", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.6-luna": { name: "GPT-5.6 Luna", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-6": { name: "GPT-6", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-6-sol": { name: "GPT-6 Sol", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-6-luna": { name: "GPT-6 Luna", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-6-astra": { name: "GPT-6 Astra", context: 272000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-6.1-sol": { name: "GPT-6.1 Sol", context: 500000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-6.1-terra": { name: "GPT-6.1 Terra", context: 500000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.5": { name: "GPT-5.5", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.4": { name: "GPT-5.4", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.4-mini": { name: "GPT-5.4 Mini", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.3-codex-spark": { name: "GPT-5.3 Codex Spark", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh", "max"] },
-  "gpt-5.2": { name: "GPT-5.2", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.6": { name: "GPT-5.6", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.6-sol": { name: "GPT-5.6 Sol", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.6-terra": { name: "GPT-5.6 Terra", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.6-luna": { name: "GPT-5.6 Luna", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-6": { name: "GPT-6", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-6-sol": { name: "GPT-6 Sol", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-6-luna": { name: "GPT-6 Luna", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-6-astra": { name: "GPT-6 Astra", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-6.1-sol": { name: "GPT-6.1 Sol", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-6.1-terra": { name: "GPT-6.1 Terra", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.5": { name: "GPT-5.5", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.4": { name: "GPT-5.4", context: 1050000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.4-mini": { name: "GPT-5.4 Mini", context: 400000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.3-codex-spark": { name: "GPT-5.3 Codex Spark", context: 128000, output: 32000, efforts: ["low", "medium", "high", "xhigh", "max"] },
+  "gpt-5.2": { name: "GPT-5.2", context: 400000, output: 128000, efforts: ["low", "medium", "high", "xhigh", "max"] },
   "codex-auto-review": { name: "Codex Auto Review", context: 128000, output: 32768, efforts: ["low", "medium", "high", "xhigh", "max"] },
 }
 
@@ -602,7 +605,7 @@ function itemText(item) {
 }
 
 // 把 Responses 请求体改写成网关能接受的形式。
-function normalizeResponsesBody(text) {
+function normalizeResponsesBody(text, { historyPacking = true } = {}) {
   let body
   try {
     body = JSON.parse(text)
@@ -654,6 +657,7 @@ function normalizeResponsesBody(text) {
     }
   }
 
+  if (historyPacking) body.input = packResponsesHistory(body.input)
   return JSON.stringify(body)
 }
 
@@ -691,6 +695,12 @@ function wireEntry(entry, { apiId, name, rate, reasoning = true } = {}) {
   }
   if (typeof rate === "number") out.rate = rate
   return out
+}
+
+// 同时更新配置形状与宿主内部形状，避免工具能力互相矛盾。
+function setToolSupport(entry, supported) {
+  entry.tool_call = supported
+  entry.capabilities.toolcall = supported
 }
 
 // 探测一个模型能不能带工具调用。
@@ -957,6 +967,7 @@ export const XingchiPlugin = async (input, options) => {
   // options.userAgent：预设名或完整 UA 字符串。选了预设就一定用它，
   // 不选则沿用上游 agent 自带的 UA（若网关放行）。
   const userAgent = resolveUserAgent(options?.userAgent)
+  const historyPacking = options?.historyPacking !== false
 
   return {
     config: async (cfg) => {
@@ -1316,7 +1327,7 @@ export const XingchiPlugin = async (input, options) => {
             let replayable = false
             if (body != null && !headers.get("content-type")?.includes("multipart")) {
               const text = typeof body === "string" ? body : new TextDecoder().decode(body)
-              let normalized = normalizeResponsesBody(text)
+              let normalized = normalizeResponsesBody(text, { historyPacking })
 
               // 模型 id 上带着分组标记时：换成那个分组的 key，并把标记去掉。
               const marked = modelInBody(text)
@@ -1374,8 +1385,7 @@ export const XingchiPlugin = async (input, options) => {
               }
               await writeGroupCache(groupCache)
               const out = {}
-              const byModel = new Map()
-              const probeKey = new Map()
+              const toolProbes = []
               const modelGroup = new Map()
 
               // 有些分组从「专属余额」里扣钱，账号没有那笔余额就列了也是 503。
@@ -1417,10 +1427,7 @@ export const XingchiPlugin = async (input, options) => {
                     { apiId: entryId, name, rate: g.rate, reasoning: spec !== undefined },
                   )
                   out[entryId] = entry
-                  const list = byModel.get(id) ?? []
-                  list.push(entry)
-                  byModel.set(id, list)
-                  if (!probeKey.has(id)) probeKey.set(id, gkey)
+                  toolProbes.push({ id, key: gkey, entry })
                   if (!modelGroup.has(id)) modelGroup.set(id, g.id)
                 }
               }
@@ -1432,9 +1439,8 @@ export const XingchiPlugin = async (input, options) => {
               }
               await writeGroupCache(groupCache)
 
-              // 工具能力实测：同一个模型探一次，结果给它各分组的条目。
-              await mapWithLimit([...byModel.keys()], 4, async (id) => {
-                const pkey = probeKey.get(id)
+              // 各分组可能连接不同上游，同名模型也必须用各自的 key 探测。
+              await mapWithLimit(toolProbes, 4, async ({ id, key: pkey, entry }) => {
                 const cached = cachedProbe(baseUrl, pkey, id)
                 const value =
                   cached !== undefined
@@ -1442,7 +1448,7 @@ export const XingchiPlugin = async (input, options) => {
                     : await probeToolSupport(baseUrl, pkey, id, ua)
                 if (value === null) return
                 if (cached === undefined) rememberProbe(baseUrl, pkey, id, value)
-                for (const entry of byModel.get(id)) entry.tool_call = value
+                setToolSupport(entry, value)
               })
 
               // 每组一把 key，记在账号里，loader 才知道该用哪把。
@@ -1505,13 +1511,13 @@ export const XingchiPlugin = async (input, options) => {
         await mapWithLimit(ids, 4, async (id) => {
           const cached = cachedProbe(baseUrl, key, id)
           if (cached !== undefined) {
-            out[id].tool_call = cached
+            setToolSupport(out[id], cached)
             return
           }
           const probed = await probeToolSupport(baseUrl, key, id, ua)
           if (probed === null) return
           rememberProbe(baseUrl, key, id, probed)
-          out[id].tool_call = probed
+          setToolSupport(out[id], probed)
         })
 
         return out

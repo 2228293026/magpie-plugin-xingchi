@@ -964,8 +964,24 @@ test("模型清单合并全部分组，名字后面带倍率", async () => {
         return new Response(
           JSON.stringify({
             data: [
-              { id: "gpt-6.1-sol", display_name: "GPT-6.1 Sol" },
-              { id: "gpt-5.6-sol", display_name: "GPT-5.6 Sol" },
+              ...[
+                "gpt-5.6",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-6",
+                "gpt-6-sol",
+                "gpt-6-luna",
+                "gpt-6-astra",
+                "gpt-6.1-sol",
+                "gpt-6.1-terra",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+                "codex-auto-review",
+                "gpt-5.2",
+              ].map((id) => ({ id, display_name: id })),
               { id: "gpt-image-1", display_name: "Image" },
             ],
           }),
@@ -1001,12 +1017,147 @@ test("模型清单合并全部分组，名字后面带倍率", async () => {
     expect(models["gpt-5.6-sol-g4"].rate).toBe(1)
     // 内部形状：推理能力在 capabilities 里，否则 magpie 当成"这模型不推理"
     expect(models["gpt-6.1-sol"].capabilities.reasoning).toBe(true)
+    // 所有目录匹配项都应同步为上游总上下文与输出规格。
+    for (const [id, context, output] of [
+      ["gpt-5.6", 1050000, 128000],
+      ["gpt-5.6-sol", 1050000, 128000],
+      ["gpt-5.6-terra", 1050000, 128000],
+      ["gpt-5.6-luna", 1050000, 128000],
+      ["gpt-6", 1050000, 128000],
+      ["gpt-6-sol", 1050000, 128000],
+      ["gpt-6-luna", 1050000, 128000],
+      ["gpt-6-astra", 1050000, 128000],
+      ["gpt-6.1-sol", 1050000, 128000],
+      ["gpt-6.1-terra", 1050000, 128000],
+      ["gpt-5.5", 1050000, 128000],
+      ["gpt-5.4", 1050000, 128000],
+      ["gpt-5.4-mini", 400000, 128000],
+      ["gpt-5.3-codex-spark", 128000, 32000],
+      ["gpt-5.2", 400000, 128000],
+    ]) {
+      expect(models[id + "-g4"].limit).toEqual({ context, output })
+    }
+    expect(models["codex-auto-review-g4"].limit).toEqual({ context: 128000, output: 32768 })
+    expect(models["gpt-6.1-sol"].limit).toEqual({ context: 1050000, output: 128000 })
+    expect(models["gpt-6.1-sol-g4"].limit).toEqual({ context: 1050000, output: 128000 })
     expect(Object.keys(models["gpt-6.1-sol"].variants)).toEqual([
       "low",
       "medium",
       "high",
       "xhigh",
       "max",
+    ])
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("单 key 的工具能力与宿主字段同步，缓存结果也保持一致", async () => {
+  const original = globalThis.fetch
+  let probes = 0
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith("/models")) {
+        return Response.json({ data: [{ id: "test-tool-capability" }] })
+      }
+      if (String(url).endsWith("/responses")) {
+        probes++
+        return Response.json({ error: { message: "This account does not support tools" } }, { status: 400 })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+    const plugin = await XingchiPlugin({ client: {} }, {})
+    const auth = { type: "api", key: "sk-test-capability-sync" }
+    for (let i = 0; i < 2; i++) {
+      const models = await plugin.provider.models({ models: {} }, { auth })
+      expect(models["test-tool-capability"].tool_call).toBe(false)
+      expect(models["test-tool-capability"].capabilities.toolcall).toBe(false)
+    }
+    expect(probes).toBe(1)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("工具探测限流时保留能力并允许下次重试", async () => {
+  const original = globalThis.fetch
+  let probes = 0
+  try {
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith("/models")) {
+        return Response.json({ data: [{ id: "test-tool-probe-retry" }] })
+      }
+      if (String(url).endsWith("/responses")) {
+        probes++
+        return probes === 1
+          ? Response.json({ error: { message: "Upstream rate limit exceeded" } }, { status: 429 })
+          : Response.json({ error: { message: "This account does not support tools" } }, { status: 400 })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+    const plugin = await XingchiPlugin({ client: {} }, {})
+    const auth = { type: "api", key: "sk-test-capability-retry" }
+    const first = await plugin.provider.models({ models: {} }, { auth })
+    expect(first["test-tool-probe-retry"].tool_call).toBe(true)
+    expect(first["test-tool-probe-retry"].capabilities.toolcall).toBe(true)
+    const second = await plugin.provider.models({ models: {} }, { auth })
+    expect(second["test-tool-probe-retry"].tool_call).toBe(false)
+    expect(second["test-tool-probe-retry"].capabilities.toolcall).toBe(false)
+    expect(probes).toBe(2)
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test("同名模型按各分组的 key 分别探测并缓存工具能力", async () => {
+  const original = globalThis.fetch
+  const probes = []
+  try {
+    globalThis.fetch = async (url, init) => {
+      const path = new URL(String(url)).pathname
+      const bearer = new Headers(init?.headers).get("authorization")
+      if (path.endsWith("/groups/available")) {
+        return Response.json({ code: 0, data: [
+          { id: 31, name: "支持工具", rate_multiplier: 1 },
+          { id: 32, name: "纯文本", rate_multiplier: 2 },
+        ] })
+      }
+      if (path.endsWith("/keys")) {
+        return Response.json({ code: 0, data: [
+          { id: 31, key: "sk-test-group-tools-31", group_id: 31, status: "active" },
+          { id: 32, key: "sk-test-group-tools-32", group_id: 32, status: "active" },
+        ] })
+      }
+      if (path.endsWith("/user/profile")) {
+        return Response.json({ code: 0, data: { balance: 100, dedicated_balance: 100 } })
+      }
+      if (path.endsWith("/models")) {
+        return Response.json({ data: [{ id: "test-group-tool-capability" }] })
+      }
+      if (path.endsWith("/responses")) {
+        probes.push(bearer)
+        return bearer === "Bearer sk-test-group-tools-31"
+          ? Response.json({ output: [{ type: "function_call" }] })
+          : Response.json({ error: { message: "This account only supports Chat Completions" } }, { status: 400 })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+    const plugin = await XingchiPlugin({ client: { auth: { set: async () => {} } } }, {})
+    const auth = {
+      type: "api",
+      key: "sk-test-group-tools-31",
+      metadata: { accessToken: "jwt-test-groups", primaryGroup: 31 },
+    }
+    for (let i = 0; i < 2; i++) {
+      const models = await plugin.provider.models({ models: {} }, { auth })
+      expect(models["test-group-tool-capability"].tool_call).toBe(true)
+      expect(models["test-group-tool-capability"].capabilities.toolcall).toBe(true)
+      expect(models["test-group-tool-capability-g32"].tool_call).toBe(false)
+      expect(models["test-group-tool-capability-g32"].capabilities.toolcall).toBe(false)
+    }
+    expect(probes.sort()).toEqual([
+      "Bearer sk-test-group-tools-31",
+      "Bearer sk-test-group-tools-32",
     ])
   } finally {
     globalThis.fetch = original
