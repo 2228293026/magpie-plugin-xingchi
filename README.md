@@ -268,13 +268,46 @@ magpie plugin options magpie-plugin-xingchi '{"userAgent":"claude-cli/2.1.327 (e
 项目标识、早期纠正后的数值、旧工具测试结果、近期工具结果和最新待办，且没有重新调用
 已完成的工具。这是有限场景的语义验证，封装仍会改变旧历史的消息结构。
 
-可关闭历史合并，恢复只做其他协议适配：
-
-```sh
-magpie plugin options magpie-plugin-xingchi '{"historyPacking":false}'
-```
-
+可在下文的 Magpie 插件选项中把 `historyPacking` 改为 `false`，关闭历史合并。
 关闭后或遇到无法安全合并的历史时，若上游仍报轮次超限，按提示新建会话。
+
+#### Codex 自动续接（可选）
+
+打开 **插件 → 已安装 → 星驰 Xingchi → 选项**。如果有多份星驰插件，选 Magpie 正在使用的那份；
+使用下方钩子时，脚本也应来自同一份以本地绝对路径登记的插件。
+
+| 选项 | 默认值 | 用途 |
+| --- | --- | --- |
+| `historyPacking` | `true` | 在原会话内合并较早的原文；无需 Codex 钩子。 |
+| `codexAutoHandoff` | `false` | 通过下方的 Codex 钩子自动创建续接会话。 |
+| `codexAutoOpen` | `true` | 交接完成后在 Codex 桌面端打开新会话；仅在自动续接开启时作用。 |
+
+如果选项显示为 JSON 编辑框，修改对应的 `true` / `false` 后点击 **保存**，其余字段保持原样。
+只用原文封装时，将 `codexAutoHandoff` 设为 `false`，自动创建和跳转都会停止；
+想自动创建但不跳转时，将 `codexAutoOpen` 设为 `false`。
+如果通过命令行修改了选项，而 Magpie 界面仍显示旧值，请先刷新插件页再查看，避免把旧值重新保存。
+
+1. 确认本机能运行 `node` 和支持 `app-server`、`Stop` 钩子的 `codex`。
+2. 将 [示例](examples/codex-handoff.hooks.json) 的 `Stop` 条目合并进 Codex 的 `hooks.json`
+   （默认 `~/.codex/hooks.json`），保留已有钩子，并把脚本路径改成实际的绝对路径。示例的 `--all-projects`
+   覆盖所有通过 Magpie 使用 `xingchi/` 模型的本机 Codex 会话，包括其他项目和 Git worktree。
+   如需限制在单个目录，把 `--all-projects` 换成该目录的绝对路径。重新打开 Codex，并在钩子管理界面审核此命令。
+3. 在 Magpie 中保存 `codexAutoHandoff: true`。示例中的 `magpie` 模式会在每次运行时读取插件的已保存选项，
+   之后把它改回 `false` 即可停止续接，无需删除钩子。用非默认 Magpie 数据目录时，
+   可用环境变量 `XINGCHI_MAGPIE_PLUGINS_FILE` 指向其中的 `plugins.json`。
+   也可独立运行：`preview` 只提示，`auto` 直接续接，`off` 停用；这些模式不读取 Magpie 开关。
+
+钩子按本地会话中实际发起的 Codex 用户回合计数。达到 95 回合后，在回复结束时创建一个新的
+Codex 会话，沿用当前会话的工作目录和 Magpie 模型路由，发出一条带交接资料的消息。新会话以只读权限启动，
+交接回复只整理状态并等待下一条用户指令。交接完成后，标题会设为 `星驰续接 · YYYY-MM-DD HH:mm:ss`
+（北京时间），脚本会请求 Codex 桌面端打开新会话。若只想创建，可关闭 `codexAutoOpen`，或在钩子命令末尾加 `--no-open`。
+没有桌面端或打不开时，仍可执行提示中的 `codex resume <会话ID>`。需要编辑文件时，在新会话中选择相应权限。
+
+交接会把旧会话的首轮需求、部分较早的用户要求和最近四轮的文本摘录发给同一模型，以保留约束与任务状态。
+旧会话及其已有的本地记录不会被修改、归档或删除。新会话只带文字摘录，图片、工具原始输出和未选中的历史不会自动带入。
+95 是本地触发点，不是对上游实际轮数的判断。
+每个旧会话最多尝试创建一次，即使等待超时也不会另建重复会话。如果提示失败，可先查看提示中的新会话 ID；
+必要时在核实没有新会话后，删除 Codex 配置目录下 `xingchi-handoff/<旧会话ID>.txt` 以允许重试。
 
 ### 3. 每日签到
 
