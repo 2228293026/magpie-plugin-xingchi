@@ -29,6 +29,7 @@ import { dirname, join as joinPath } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { openBrowserSession } from "./browser.mjs"
+import { packResponsesHistory } from "./history.mjs"
 
 const PROVIDER = "xingchi"
 const BASE_URL = "https://api.xingchiapi.com/v1"
@@ -604,7 +605,7 @@ function itemText(item) {
 }
 
 // 把 Responses 请求体改写成网关能接受的形式。
-function normalizeResponsesBody(text) {
+function normalizeResponsesBody(text, { historyPacking = true } = {}) {
   let body
   try {
     body = JSON.parse(text)
@@ -656,6 +657,7 @@ function normalizeResponsesBody(text) {
     }
   }
 
+  if (historyPacking) body.input = packResponsesHistory(body.input)
   return JSON.stringify(body)
 }
 
@@ -693,6 +695,12 @@ function wireEntry(entry, { apiId, name, rate, reasoning = true } = {}) {
   }
   if (typeof rate === "number") out.rate = rate
   return out
+}
+
+// 同时更新配置形状与宿主内部形状，避免工具能力互相矛盾。
+function setToolSupport(entry, supported) {
+  entry.tool_call = supported
+  entry.capabilities.toolcall = supported
 }
 
 // 探测一个模型能不能带工具调用。
@@ -959,6 +967,7 @@ export const XingchiPlugin = async (input, options) => {
   // options.userAgent：预设名或完整 UA 字符串。选了预设就一定用它，
   // 不选则沿用上游 agent 自带的 UA（若网关放行）。
   const userAgent = resolveUserAgent(options?.userAgent)
+  const historyPacking = options?.historyPacking !== false
 
   return {
     config: async (cfg) => {
@@ -1318,7 +1327,7 @@ export const XingchiPlugin = async (input, options) => {
             let replayable = false
             if (body != null && !headers.get("content-type")?.includes("multipart")) {
               const text = typeof body === "string" ? body : new TextDecoder().decode(body)
-              let normalized = normalizeResponsesBody(text)
+              let normalized = normalizeResponsesBody(text, { historyPacking })
 
               // 模型 id 上带着分组标记时：换成那个分组的 key，并把标记去掉。
               const marked = modelInBody(text)
@@ -1376,8 +1385,7 @@ export const XingchiPlugin = async (input, options) => {
               }
               await writeGroupCache(groupCache)
               const out = {}
-              const byModel = new Map()
-              const probeKey = new Map()
+              const toolProbes = []
               const modelGroup = new Map()
 
               // 有些分组从「专属余额」里扣钱，账号没有那笔余额就列了也是 503。
@@ -1419,10 +1427,7 @@ export const XingchiPlugin = async (input, options) => {
                     { apiId: entryId, name, rate: g.rate, reasoning: spec !== undefined },
                   )
                   out[entryId] = entry
-                  const list = byModel.get(id) ?? []
-                  list.push(entry)
-                  byModel.set(id, list)
-                  if (!probeKey.has(id)) probeKey.set(id, gkey)
+                  toolProbes.push({ id, key: gkey, entry })
                   if (!modelGroup.has(id)) modelGroup.set(id, g.id)
                 }
               }
@@ -1434,9 +1439,8 @@ export const XingchiPlugin = async (input, options) => {
               }
               await writeGroupCache(groupCache)
 
-              // 工具能力实测：同一个模型探一次，结果给它各分组的条目。
-              await mapWithLimit([...byModel.keys()], 4, async (id) => {
-                const pkey = probeKey.get(id)
+              // 各分组可能连接不同上游，同名模型也必须用各自的 key 探测。
+              await mapWithLimit(toolProbes, 4, async ({ id, key: pkey, entry }) => {
                 const cached = cachedProbe(baseUrl, pkey, id)
                 const value =
                   cached !== undefined
@@ -1444,7 +1448,7 @@ export const XingchiPlugin = async (input, options) => {
                     : await probeToolSupport(baseUrl, pkey, id, ua)
                 if (value === null) return
                 if (cached === undefined) rememberProbe(baseUrl, pkey, id, value)
-                for (const entry of byModel.get(id)) entry.tool_call = value
+                setToolSupport(entry, value)
               })
 
               // 每组一把 key，记在账号里，loader 才知道该用哪把。
@@ -1507,13 +1511,13 @@ export const XingchiPlugin = async (input, options) => {
         await mapWithLimit(ids, 4, async (id) => {
           const cached = cachedProbe(baseUrl, key, id)
           if (cached !== undefined) {
-            out[id].tool_call = cached
+            setToolSupport(out[id], cached)
             return
           }
           const probed = await probeToolSupport(baseUrl, key, id, ua)
           if (probed === null) return
           rememberProbe(baseUrl, key, id, probed)
-          out[id].tool_call = probed
+          setToolSupport(out[id], probed)
         })
 
         return out

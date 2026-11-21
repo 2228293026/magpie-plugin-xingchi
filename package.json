@@ -7,6 +7,7 @@
   "files": [
     "index.mjs",
     "browser.mjs",
+    "history.mjs",
     "README.md",
     "LICENSE",
     "icon.svg"

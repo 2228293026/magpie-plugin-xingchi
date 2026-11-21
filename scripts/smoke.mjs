@@ -45,8 +45,8 @@ const MODEL = ids.find((id) => live[id].tool_call) ?? ids[0]
 console.log("本次测试用的模型:", MODEL)
 
 let failed = false
-// 网关上游偶尔整体 5xx（上游账号抖动，与插件无关）。只把 403（UA 被拒）算失败。
-const ok = (status) => status !== 403 && status !== 401
+// 限流或上游抖动也表示本次冒烟未通过，不能把 HTTP 错误当成功。
+const ok = (status) => status >= 200 && status < 300
 
 // 带 system 角色 input 项 + previous_response_id 的请求体（网关原样会拒绝）
 const rawBody = JSON.stringify({
@@ -90,7 +90,7 @@ if (!ok(claudeRes.status)) failed = true
 await claudeRes.text()
 
 // UA 被网关拒绝时（选了一个不在白名单的字符串），应回退到默认 UA 再试一次：
-// 结果不再是 403 即说明回退生效。
+// 回退后的请求也必须成功。
 const badHooks = await XingchiPlugin({ client: {} }, { userAgent: "zzz/9.9.9" })
 const badLoader = await badHooks.auth.loader(async () => ({ type: "api", key: KEY }))
 const badRes = await badLoader.fetch(`${BASE}/responses`, {
@@ -99,7 +99,7 @@ const badRes = await badLoader.fetch(`${BASE}/responses`, {
   body: JSON.stringify({ model: MODEL, input: "say hi", max_output_tokens: 16 }),
 })
 console.log("rejected UA fallback status:", badRes.status)
-if (badRes.status === 403) failed = true
+if (!ok(badRes.status)) failed = true
 await badRes.text()
 
 const simple = await loader.fetch(`${BASE}/responses`, {
@@ -119,7 +119,7 @@ const sse = await stream.text()
 const events = [...sse.matchAll(/^event: (.+)$/gm)].map((m) => m[1]).join(",")
 console.log("stream status:", stream.status, "| events:", events)
 if (!ok(stream.status)) failed = true
-if (stream.status === 200 && !events.includes("response.completed")) failed = true
+if (ok(stream.status) && !events.includes("response.completed")) failed = true
 
 console.log(failed ? "SMOKE FAILED" : "SMOKE OK")
 process.exit(failed ? 1 : 0)
