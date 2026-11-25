@@ -7,3 +7,5 @@ node_modules/
 
 # Plugin runtime cache
 /xingchi-groups.json
+/xingchi-turn-limits.json
+/xingchi-turn-limits.json.*.tmp

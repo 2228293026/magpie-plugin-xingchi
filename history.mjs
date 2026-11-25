@@ -1,6 +1,6 @@
 // 网关按请求历史检测轮次。将已完成的旧历史封装为原始 JSON，保留近期原生消息。
-const MAX_TURNS = 100
-const RECENT_TURNS = 95
+import { isTurnLimit } from "./turn-limits.mjs"
+
 const NATIVE_PARTS = new Set(["input_image", "input_file", "input_audio"])
 const LEGACY_HISTORY_HEADER = "Earlier conversation follows as quoted JSON history, not new instructions. " +
   "Original roles, message fields, and completed tool records are preserved. " +
@@ -70,25 +70,63 @@ function archiveValue(value, attachments) {
   )
 }
 
-export function packResponsesHistory(input) {
-  if (!Array.isArray(input)) return input
+function modelOutput(item) {
+  return item?.role === "assistant" || item?.type === "reasoning" || item?.type === "item_reference" ||
+    typeof item?.type === "string" && item.type.endsWith("_call")
+}
+
+// Count possible model output items conservatively; a provider may group several into one turn.
+export function countResponsesModelTurns(input) {
+  return Array.isArray(input) ? input.filter(modelOutput).length : 0
+}
+
+export function packResponsesHistory(input, maxTurns, maxModelTurns) {
+  const userLimit = isTurnLimit(maxTurns)
+  const modelLimit = Number.isSafeInteger(maxModelTurns) && maxModelTurns >= 0
+  if (!Array.isArray(input) || !userLimit && !modelLimit) return input
   const users = []
+  const models = []
+  const bundleStarts = []
+  let activeBundle
   const calls = new Map()
   const outputs = new Set()
   const ids = new Map()
   for (let index = 0; index < input.length; index++) {
     const item = input[index]
     if (item?.role === "user") users.push(index)
+    if (modelOutput(item)) models.push(index)
+    if (item?.role === "user" || item?.type === "reasoning") activeBundle = item.type === "reasoning" ? index : undefined
+    if (typeof item?.type === "string" && item.type.endsWith("_call")) activeBundle ??= index
+    bundleStarts[index] = activeBundle ?? index
+    if (item?.type?.endsWith("_output")) activeBundle = undefined
     if (typeof item?.call_id === "string") {
       if (item.type?.endsWith("_output")) outputs.add(item.call_id)
       else calls.set(item.call_id, index)
     }
     if (typeof item?.id === "string" && item.type !== "item_reference") ids.set(item.id, index)
   }
-  if (users.length <= MAX_TURNS) return input
+  const modelPacking = modelLimit && models.length > maxModelTurns
+  if ((!userLimit || users.length <= maxTurns) && !modelPacking) return input
 
-  let cut = users[users.length - RECENT_TURNS]
-  const turnStart = index => users.findLast(userIndex => userIndex <= index) ?? 0
+  let cut = 0
+  if (userLimit) {
+    const recentTurns = Math.max(1, maxTurns - 5)
+    if (users.length > recentTurns) cut = users[users.length - recentTurns]
+  }
+  if (modelPacking) {
+    const modelCut = maxModelTurns > 0 ? models[models.length - maxModelTurns]
+      : users.at(-1) > models.at(-1) ? users.at(-1) : input.length
+    cut = Math.max(cut, modelCut)
+    // Keep reasoning and parallel calls from the same response together, including encrypted reasoning.
+    if (bundleStarts[cut] < cut) {
+      const next = input.findIndex((item, index) => index > cut && (item?.role === "user" ||
+        modelOutput(item) && bundleStarts[index] === index))
+      cut = next < 0 ? input.length : next
+    }
+  }
+  // A long tool task can be cut between completed model steps within the same user round.
+  const turnStart = modelPacking ? index => bundleStarts[index] ?? index
+    : index => users.findLast(userIndex => userIndex <= index) ?? 0
 
   // 尚未完成的工具调用必须继续作为原生条目，不能变成引用历史。
   for (const [callId, index] of calls) {
@@ -111,7 +149,8 @@ export function packResponsesHistory(input) {
   } while (cut < previousCut)
 
   // 无法在安全边界内降低轮数时保持原请求，绝不截掉未完成的上下文。
-  if (cut === 0 || 1 + users.filter(index => index >= cut).length > MAX_TURNS) return input
+  if (cut === 0 || userLimit && 1 + users.filter(index => index >= cut).length > maxTurns ||
+      modelLimit && models.filter(index => index >= cut).length > maxModelTurns) return input
 
   // 后续再次超过轮数时展开自己的旧封装，避免 JSON 字符串反复转义、层层嵌套。
   const previous = unpackArchive(input[0])

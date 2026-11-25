@@ -8,6 +8,8 @@
     "index.mjs",
     "browser.mjs",
     "history.mjs",
+    "turn-limits.mjs",
+    "stream-limits.mjs",
     "scripts/codex-handoff.mjs",
     "examples/codex-handoff.hooks.json",
     "README.md",

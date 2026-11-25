@@ -1,8 +1,11 @@
 import { expect, test } from "bun:test"
+import { spawnSync } from "node:child_process"
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
-import { appServer, readHandoffTranscript, readMagpieOptions, runHandoff } from "../scripts/codex-handoff.mjs"
+import { isAbsolute, join, relative } from "node:path"
+import { fileURLToPath } from "node:url"
+import { appServer, readHandoffTranscript, readHandoffTurnLimit, readMagpieOptions, runHandoff } from "../scripts/codex-handoff.mjs"
+import { createTurnLimitCache, turnLimitScope, TURN_LIMIT_CACHE_FILE, TURN_LIMIT_TTL_MS } from "../turn-limits.mjs"
 
 const oldId = "00000000-0000-4000-8000-000000000001"
 const newId = "00000000-0000-4000-8000-000000000002"
@@ -38,9 +41,14 @@ async function withTranscript(count, check, provider) {
     const transcriptPath = join(project, "rollout.jsonl")
     await writeFile(transcriptPath, transcript(count, provider).join("\n"))
     const event = { hook_event_name: "Stop", cwd: project, transcript_path: transcriptPath, session_id: oldId, model }
-    await check(event, { project, stateDir: join(project, "state") })
+    await check(event, { project, stateDir: join(project, "state"), getTurnLimit: async () => 20 })
   } finally {
-    await rm(project, { recursive: true, force: true })
+    const target = await realpath(project)
+    const within = relative(await realpath(tmpdir()), target)
+    if (isAbsolute(within) || within.startsWith("..") || !within.startsWith("xingchi-handoff-")) {
+      throw new Error("Fixture cleanup escaped its temporary directory")
+    }
+    await rm(target, { recursive: true, force: true })
   }
 }
 
@@ -82,6 +90,34 @@ test("读取当前插件路径的 Magpie 开关，忽略同名副本并反映后
   })
 })
 
+test("独立 CLI 预览读取自定义网关的上限，不受 Magpie 自动续接开关影响", async () => {
+  await withTranscript(95, async (event, { project }) => {
+    const configFile = join(project, "plugins.json")
+    const baseUrl = "https://custom.example/v1"
+    const key = "sk-handoff-custom-fixture"
+    await writeFile(configFile, JSON.stringify({ plugins: [{
+      spec: fileURLToPath(new URL("../", import.meta.url)),
+      options: { baseUrl, codexAutoHandoff: false, codexAutoOpen: false },
+    }] }))
+    await writeFile(join(project, "plugin-auth.json"), JSON.stringify({ xingchi: { type: "api", key } }))
+    const cache = createTurnLimitCache(project)
+    await cache.remember(turnLimitScope(baseUrl, key, "gpt-6.1-sol"), 100)
+    const result = spawnSync(process.execPath, [
+      fileURLToPath(new URL("../scripts/codex-handoff.mjs", import.meta.url)),
+      "preview", "--all-projects", "--no-open",
+    ], {
+      input: JSON.stringify(event), encoding: "utf8", cwd: project,
+      env: { ...process.env, XINGCHI_MAGPIE_PLUGINS_FILE: configFile },
+      windowsHide: true, timeout: 10000,
+    })
+    expect(result.error).toBeUndefined()
+    expect(result.status).toBe(0)
+    const preview = JSON.parse(result.stdout)
+    expect(preview.systemMessage).toContain("已观察上限 100")
+    expect(preview.systemMessage).toContain("续接阈值 95")
+  })
+})
+
 test("只按自己的 Codex 用户回合计数，同一回合和模型请求不会重复计数", async () => {
   const lines = transcript(95)
   lines.push(JSON.stringify(completed("turn-95", { type: "UserMessage", content: [{ type: "text", text: "Follow-up" }] })))
@@ -98,15 +134,15 @@ test("只按自己的 Codex 用户回合计数，同一回合和模型请求不�
   expect(context).not.toMatch(/private-image|subagent|provider replay/)
 })
 
-test("关闭、预览、未达阈值和非星驰回合都不会启动 App Server", async () => {
+test("14 回合不续接，15 回合预览及关闭或非星驰回合都不会启动 App Server", async () => {
   const connect = () => { throw new Error("不应创建会话") }
-  await withTranscript(94, async (event, options) => {
+  await withTranscript(14, async (event, options) => {
     expect(await runHandoff(event, { ...options, mode: "auto", connect })).toEqual({})
   })
-  await withTranscript(95, async (event, options) => {
+  await withTranscript(15, async (event, options) => {
     expect(await runHandoff(event, { ...options, mode: "off", connect })).toEqual({})
     const preview = await runHandoff(event, { ...options, mode: "preview", connect })
-    expect(preview.systemMessage).toContain("95")
+    expect(preview.systemMessage).toContain("15")
     expect(await runHandoff({ ...event, model: "other/model" }, { ...options, mode: "auto", connect })).toEqual({})
     expect(await runHandoff({ ...event, stop_hook_active: true }, { ...options, mode: "auto", connect })).toEqual({})
     expect(await runHandoff(event, { ...options, project: tmpdir(), mode: "auto", connect })).toEqual({})
@@ -136,8 +172,8 @@ test("全目录模式在其他工作区触发，并把原工作目录传给新�
   })
 })
 
-test("达到阈值后创建一条新会话，等待交接完成，且不重复创建", async () => {
-  await withTranscript(95, async (event, options) => {
+test("第 15 回合创建一条新会话，等待交接完成，且不重复创建", async () => {
+  await withTranscript(15, async (event, options) => {
     const { connect, calls } = mockServer()
     const settings = { ...options, mode: "auto", connect, openThread: async id => { calls.push(["open", id]) } }
     const result = await runHandoff(event, settings)
@@ -149,7 +185,7 @@ test("达到阈值后创建一条新会话，等待交接完成，且不重复�
     expect(calls[2][1]).toMatchObject({ model, modelProvider: "magpie", sandbox: "read-only", approvalPolicy: "never" })
     expect(calls[3][1]).toMatchObject({ threadId: newId, effort: "medium" })
     expect(calls[3][1].input[0].text).toContain("Keep retry_limit=7")
-    expect(calls[3][1].input[0].text).toContain("Validated 95")
+    expect(calls[3][1].input[0].text).toContain("Validated 15")
     expect(calls[4]).toEqual(["wait", newId, "handoff-turn"])
     expect(calls[5][1]).toEqual({ threadId: newId, name: "星驰续接 · 2026-11-22 00:42:00" })
     expect(calls.at(-1)).toEqual(["open", newId])
@@ -219,4 +255,60 @@ test("App Server 先发 turn/completed 再回 turn/start 也能完成交接", as
   } finally {
     client.close()
   }
+})
+
+test("未知上限或上限为 1 时不自动创建，预览明确说明没有可用观察值", async () => {
+  const connect = () => { throw new Error("不应创建会话") }
+  await withTranscript(95, async (event, options) => {
+    for (const limit of [undefined, 1]) {
+      const settings = { ...options, connect, getTurnLimit: async () => limit }
+      expect(await runHandoff(event, { ...settings, mode: "auto" })).toEqual({})
+      expect((await runHandoff(event, { ...settings, mode: "preview" })).systemMessage).toContain("没有可用")
+    }
+  })
+})
+
+test.each([[10, 4, 5], [100, 94, 95], [5, 1, 2], [2, 1, 2]])(
+  "续接阈值随上限 %s 变化，交接自身的第一轮不会无限续接", async (limit, before, at) => {
+    const connect = () => { throw new Error("不应创建会话") }
+    await withTranscript(before, async (event, options) => {
+      expect(await runHandoff(event, { ...options, mode: "auto", connect, getTurnLimit: async () => limit })).toEqual({})
+    })
+    await withTranscript(at, async (event, options) => {
+      const result = await runHandoff(event, { ...options, mode: "preview", connect, getTurnLimit: async () => limit })
+      expect(result.systemMessage).toContain(`上限 ${limit}`)
+      expect(result.systemMessage).toContain(`阈值 ${at}`)
+    })
+  },
+)
+
+test("续接读取当前账号和分组的观察值，忽略其他服务、模型、过期及已移除账号", async () => {
+  await withTranscript(1, async (_event, { project }) => {
+    const base = "https://api.xingchiapi.com/v1"
+    const apiModel = "gpt-6.1-sol"
+    const accounts = {
+      xingchi: { type: "oauth", access: "sk-handoff-a", metadata: { groupKeys: { 4: "sk-handoff-a4" } } },
+      "xingchi#b": { type: "api", key: "sk-handoff-b", metadata: { groupKeys: { 4: "sk-handoff-b4" } } },
+      other: { type: "api", key: "sk-unrelated" },
+    }
+    await writeFile(join(project, "plugin-auth.json"), JSON.stringify(accounts))
+    const cache = createTurnLimitCache(project)
+    await cache.remember(turnLimitScope(base, "sk-handoff-a", apiModel), 20)
+    await cache.remember(turnLimitScope(base, "sk-handoff-b", apiModel), 30)
+    await cache.remember(turnLimitScope(base, "sk-handoff-a4", apiModel), 10)
+    await cache.remember(turnLimitScope(base, "sk-unrelated", apiModel), 1)
+    await cache.remember(turnLimitScope(base, "sk-removed-account", apiModel), 2)
+    expect(await readHandoffTurnLimit(model, project)).toBe(20)
+    expect(await readHandoffTurnLimit(model + "-g4", project)).toBe(10)
+    expect(await readHandoffTurnLimit("xingchi/gpt-5.6", project)).toBeUndefined()
+    expect(await readHandoffTurnLimit(model, project, "https://other.example/v1")).toBeUndefined()
+    const file = join(project, TURN_LIMIT_CACHE_FILE)
+    const data = JSON.parse(await readFile(file, "utf8"))
+    data.limits[turnLimitScope(base, "sk-handoff-a", apiModel)].at = Date.now() - TURN_LIMIT_TTL_MS - 1
+    await writeFile(file, JSON.stringify(data))
+    expect(await readHandoffTurnLimit(model, project)).toBe(30)
+    delete accounts["xingchi#b"]
+    await writeFile(join(project, "plugin-auth.json"), JSON.stringify(accounts))
+    expect(await readHandoffTurnLimit(model, project)).toBeUndefined()
+  })
 })

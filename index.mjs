@@ -29,7 +29,9 @@ import { dirname, join as joinPath } from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { openBrowserSession } from "./browser.mjs"
-import { packResponsesHistory } from "./history.mjs"
+import { countResponsesModelTurns, packResponsesHistory } from "./history.mjs"
+import { createTurnLimitCache, isTurnLimit, parseTurnFeedback, turnLimitScope } from "./turn-limits.mjs"
+import { inspectStreamTurnLimit } from "./stream-limits.mjs"
 
 const PROVIDER = "xingchi"
 const BASE_URL = "https://api.xingchiapi.com/v1"
@@ -605,7 +607,7 @@ function itemText(item) {
 }
 
 // 把 Responses 请求体改写成网关能接受的形式。
-function normalizeResponsesBody(text, { historyPacking = true } = {}) {
+function normalizeResponsesBody(text, { historyPacking = true, maxTurns, maxModelTurns } = {}) {
   let body
   try {
     body = JSON.parse(text)
@@ -657,7 +659,7 @@ function normalizeResponsesBody(text, { historyPacking = true } = {}) {
     }
   }
 
-  if (historyPacking) body.input = packResponsesHistory(body.input)
+  if (historyPacking) body.input = packResponsesHistory(body.input, maxTurns, maxModelTurns)
   return JSON.stringify(body)
 }
 
@@ -968,6 +970,7 @@ export const XingchiPlugin = async (input, options) => {
   // 不选则沿用上游 agent 自带的 UA（若网关放行）。
   const userAgent = resolveUserAgent(options?.userAgent)
   const historyPacking = options?.historyPacking !== false
+  const turnLimits = createTurnLimitCache(magpieDir)
 
   return {
     config: async (cfg) => {
@@ -1322,12 +1325,23 @@ export const XingchiPlugin = async (input, options) => {
           async fetch(input, init) {
             const headers = new Headers(init?.headers)
             headers.set("user-agent", pickUserAgent(headers.get("user-agent"), userAgent))
+            if (!headers.get("authorization")) headers.set("authorization", `Bearer ${key}`)
 
             let body = init?.body
             let replayable = false
+            let originalText
+            let serialized
+            let scope
+            let modelScope
+            let encode
+            let canPack = false
+            const packingOptions = async () => {
+              const [maxTurns, maxModelTurns] = await Promise.all([turnLimits.get(scope), turnLimits.get(modelScope)])
+              return { historyPacking, maxTurns, maxModelTurns }
+            }
             if (body != null && !headers.get("content-type")?.includes("multipart")) {
               const text = typeof body === "string" ? body : new TextDecoder().decode(body)
-              let normalized = normalizeResponsesBody(text, { historyPacking })
+              let normalized = normalizeResponsesBody(text, { historyPacking: false })
 
               // 模型 id 上带着分组标记时：换成那个分组的 key，并把标记去掉。
               const marked = modelInBody(text)
@@ -1337,23 +1351,86 @@ export const XingchiPlugin = async (input, options) => {
                 normalized = stripModelMark(normalized, marked.raw)
               }
 
-              body = typeof body === "string" ? normalized : new TextEncoder().encode(normalized)
+              originalText = normalized
+              encode = typeof body === "string" ? value => value : value => new TextEncoder().encode(value)
+              try {
+                const parsed = JSON.parse(originalText)
+                if (parsed && typeof parsed === "object" && "input" in parsed) {
+                  canPack = Array.isArray(parsed.input) && (parsed.input.filter(item => item?.role === "user").length > 1 ||
+                    countResponsesModelTurns(parsed.input) > 0)
+                  const url = input?.url ?? String(input)
+                  const credential = headers.get("authorization").replace(/^Bearer\s+/i, "")
+                  scope = turnLimitScope(url, credential, parsed.model)
+                  modelScope = turnLimitScope(url, credential, parsed.model, "model")
+                }
+              } catch {}
+              serialized = normalizeResponsesBody(originalText, await packingOptions())
+              body = encode(serialized)
               replayable = true
             }
-            if (!headers.get("authorization")) headers.set("authorization", `Bearer ${key}`)
 
-            const res = await fetch(input, { ...init, headers, body })
-
-            // 网关按 UA 第一段放行客户端；选了不被放行的 UA 时回退到默认 UA 再试一次。
-            if (res.status === 403 && replayable && headers.get("user-agent") !== DEFAULT_UA) {
-              const peek = await res.clone().text()
-              if (peek.includes("client_not_allowed")) {
-                const retry = new Headers(headers)
-                retry.set("user-agent", DEFAULT_UA)
-                return await fetch(input, { ...init, headers: retry, body })
+            let uaRetried = false
+            let turnRetried = false
+            for (;;) {
+              const sentHistory = scope ? JSON.parse(serialized).input : undefined
+              const sentModels = countResponsesModelTurns(sentHistory)
+              const rememberFeedback = async feedback => {
+                if (!feedback) return
+                if (feedback.metric === "user") return turnLimits.remember(scope, feedback.limit)
+                if (feedback.limit === undefined && sentModels === 0) return
+                // A reported model count is a rejected count, not an exact ceiling. Back off conservatively.
+                const proposed = feedback.limit === undefined
+                  ? Math.floor(Math.min(feedback.rejectedAt, sentModels) / 2) : Math.max(0, feedback.limit - 5)
+                await turnLimits.remember(modelScope, proposed, "model")
               }
+              const fetched = await fetch(input, { ...init, headers, body })
+              const canFallbackUa = fetched.status === 403 && replayable && !uaRetried &&
+                headers.get("user-agent") !== DEFAULT_UA
+              const inspected = scope || canFallbackUa ? await inspectStreamTurnLimit(fetched,
+                (_limit, feedback) => rememberFeedback(feedback), { peek: (historyPacking && !turnRetried && canPack) || canFallbackUa })
+                : { response: fetched }
+              const res = inspected.response
+              let feedback = inspected.feedback
+              let clientNotAllowed = inspected.errorCode === "client_not_allowed"
+              let outputStarted = false
+              if (replayable && feedback === undefined &&
+                  !res.headers.get("content-type")?.includes("text/event-stream") &&
+                  (!res.ok || res.headers.get("content-type")?.includes("application/json"))) {
+                const peek = await res.clone().text()
+                // 两种网关拒绝各重试一次；不重试配额、网络或普通上游失败。
+                clientNotAllowed ||= peek.includes("client_not_allowed")
+                let error
+                try { error = JSON.parse(peek) } catch {}
+                if (!res.ok || error?.status !== "completed") feedback = parseTurnFeedback(error)
+                const output = error?.response?.output ?? error?.output
+                outputStarted = Array.isArray(output) && output.length > 0
+              }
+              if (canFallbackUa && clientNotAllowed && !outputStarted) {
+                uaRetried = true
+                headers.set("user-agent", DEFAULT_UA)
+                if (res.body) await res.body.cancel().catch(() => {})
+                continue
+              }
+              if (scope && feedback !== undefined) {
+                await rememberFeedback(feedback)
+                if (historyPacking && !turnRetried && !outputStarted) {
+                  const limits = await packingOptions()
+                  const retry = normalizeResponsesBody(originalText, limits)
+                  const packed = JSON.parse(retry).input
+                  if (retry !== serialized && Array.isArray(packed) &&
+                      (!isTurnLimit(limits.maxTurns) || packed.filter(item => item?.role === "user").length <= limits.maxTurns) &&
+                      (limits.maxModelTurns === undefined || countResponsesModelTurns(packed) <= limits.maxModelTurns) &&
+                      (feedback.metric !== "model" || countResponsesModelTurns(packed) < sentModels)) {
+                    turnRetried = true
+                    serialized = retry
+                    body = encode(retry)
+                    if (res.body) await res.body.cancel().catch(() => {})
+                    continue
+                  }
+                }
+              }
+              return res
             }
-            return res
           },
         }
       },

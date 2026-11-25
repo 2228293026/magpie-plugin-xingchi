@@ -2,12 +2,12 @@ import { execFile, spawn } from "node:child_process"
 import { createReadStream } from "node:fs"
 import { access, mkdir, open, readFile, realpath } from "node:fs/promises"
 import { homedir } from "node:os"
-import { isAbsolute, join, normalize } from "node:path"
+import { dirname, isAbsolute, join, normalize } from "node:path"
 import { createInterface } from "node:readline"
 import { fileURLToPath } from "node:url"
 import { promisify } from "node:util"
+import { createTurnLimitCache, isTurnLimit, turnLimitScope } from "../turn-limits.mjs"
 
-const TURN_THRESHOLD = 95
 const ID = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i
 const runFile = promisify(execFile)
 const titleTime = new Intl.DateTimeFormat("sv-SE", {
@@ -167,7 +167,28 @@ export async function readMagpieOptions(configFile, pluginDirectory) {
   return {}
 }
 
-export async function runHandoff(event, { mode, project, stateDir, connect = appServer, openThread }) {
+export async function readHandoffTurnLimit(model, directory, baseUrl = "https://api.xingchiapi.com/v1") {
+  const routed = typeof model === "string" ? model.match(/^xingchi\/(.+)$/) : null
+  if (!routed) return undefined
+  let accounts
+  try { accounts = JSON.parse(await readFile(join(directory, "plugin-auth.json"), "utf8")) } catch { return undefined }
+  const marked = routed[1].match(/^(.*)-g(\d+)$/)
+  const apiModel = marked?.[1] ?? routed[1]
+  const cache = createTurnLimitCache(directory)
+  const limits = []
+  for (const [id, account] of Object.entries(accounts ?? {})) {
+    if (id !== "xingchi" && !id.startsWith("xingchi#")) continue
+    const primary = account?.key ?? account?.access ?? account?.metadata?.apiKey ?? ""
+    if (!primary) continue
+    const key = marked ? account.metadata?.groupKeys?.[marked[2]] ?? primary : primary
+    const limit = await cache.get(turnLimitScope(baseUrl, key, apiModel))
+    if (isTurnLimit(limit)) limits.push(limit)
+  }
+  return limits.length ? Math.min(...limits) : undefined
+}
+
+export async function runHandoff(event, { mode, project, stateDir, connect = appServer, openThread,
+  getTurnLimit = async () => undefined }) {
   if (mode === "off" || event?.hook_event_name !== "Stop" || event.stop_hook_active ||
       !ID.test(event.session_id ?? "") || typeof event.model !== "string" || !event.model.startsWith("xingchi/") ||
       typeof event.cwd !== "string" || !isAbsolute(event.cwd) || typeof event.transcript_path !== "string" ||
@@ -176,9 +197,16 @@ export async function runHandoff(event, { mode, project, stateDir, connect = app
   if (project !== "--all-projects" && cwd !== await realpath(project)) return {}
   const lines = createInterface({ input: createReadStream(event.transcript_path), crlfDelay: Infinity })
   const history = await readHandoffTranscript(lines, event.session_id)
-  if (history.provider !== "magpie" || history.count < TURN_THRESHOLD) return {}
+  if (history.provider !== "magpie") return {}
+  const limit = await getTurnLimit(event.model)
+  if (!isTurnLimit(limit) || limit < 2) {
+    return mode === "preview" ? { systemMessage: `星驰会话已有 ${history.count} 个 Codex 用户回合；当前没有可用的轮次上限观察值，没有创建续接会话。` } : {}
+  }
+  // The handoff's own first round must not immediately trigger another handoff.
+  const threshold = Math.max(2, limit - 5)
+  if (history.count < threshold) return {}
   if (mode === "preview") {
-    return { systemMessage: `星驰会话已有 ${history.count} 个 Codex 用户回合；自动续接预览，没有创建会话。` }
+    return { systemMessage: `星驰会话已有 ${history.count} 个 Codex 用户回合；已观察上限 ${limit}，续接阈值 ${threshold}。自动续接预览，没有创建会话。` }
   }
   if (mode !== "auto") return {}
 
@@ -256,13 +284,16 @@ async function main() {
       throw new Error("参数应为 off，或 magpie/preview/auto 加 --all-projects 或项目绝对路径，可追加 --no-open")
     }
     let openThread = options.includes("--no-open") ? undefined : openDesktopThread
+    const configFile = process.env.XINGCHI_MAGPIE_PLUGINS_FILE || join(homedir(), ".config", "magpie", "plugins.json")
+    const pluginDirectory = fileURLToPath(new URL("../", import.meta.url))
+    let settings = {}
     if (mode === "magpie") {
-      const configFile = process.env.XINGCHI_MAGPIE_PLUGINS_FILE || join(homedir(), ".config", "magpie", "plugins.json")
-      const pluginDirectory = fileURLToPath(new URL("../", import.meta.url))
-      const settings = await readMagpieOptions(configFile, pluginDirectory)
+      settings = await readMagpieOptions(configFile, pluginDirectory)
       if (settings.codexAutoHandoff !== true) return console.log("{}")
       if (settings.codexAutoOpen === false) openThread = undefined
       mode = "auto"
+    } else {
+      settings = await readMagpieOptions(configFile, pluginDirectory).catch(() => ({}))
     }
     const chunks = []
     let bytes = 0
@@ -273,7 +304,9 @@ async function main() {
     }
     const event = JSON.parse(Buffer.concat(chunks).toString("utf8"))
     const stateDir = join(process.env.CODEX_HOME || join(homedir(), ".codex"), "xingchi-handoff")
-    console.log(JSON.stringify(await runHandoff(event, { mode, project, stateDir, openThread })))
+    console.log(JSON.stringify(await runHandoff(event, { mode, project, stateDir, openThread,
+      getTurnLimit: model => readHandoffTurnLimit(model, dirname(configFile), settings.baseUrl),
+    })))
   } catch (error) {
     console.log(JSON.stringify({ systemMessage: `星驰自动续接未运行：${error.code || "请检查钩子输入和项目路径"}。` }))
   }
